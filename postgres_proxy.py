@@ -363,6 +363,7 @@ class BaseServer:
 
                 print(log_tag, "Acceptable username, connecting upstream", login_username)
 
+                # TODO: this might raise.
                 upstream_reader, upstream_writer = \
                         await asyncio.open_connection(*self.upstream)
 
@@ -400,6 +401,7 @@ class BaseServer:
         except asyncio.IncompleteReadError as e:
             print(log_tag, "EOF", e)
         except Exception as e:
+            # TODO: this is too harsh.
             asyncio.get_running_loop().stop()
             raise e
         finally:
