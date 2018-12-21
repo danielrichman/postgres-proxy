@@ -6,6 +6,9 @@ import socket
 import struct
 import sys
 
+# TODO: can write raise?
+# TODO: does `with writer` work?
+
 class PostgresProtocolError(Exception):
     def __init__(self, sentence, **kwargs):
         self.sentence = sentence
@@ -377,23 +380,26 @@ class BaseServer:
 
         return socket_username
 
+    async def pass_on_cancel_request(self, startup_message):
+        assert startup_message.kind == "CancelRequest"
+
+        client.log("Passing on cancel request")
+
+        try:
+            upstream_reader, upstream_writer = \
+                    await asyncio.open_connection(*self.upstream)
+
+            with upstream_writer:
+                upstream_writer.write(startup_message.rawmsg)
+        except Exception as e:
+            client.log("Passing on cancel request failed", e)
+
     async def really_handle_connection(self, client)
         startup_message = await self.skip_ssl_request_and_get_startup_message(client)
 
         if startup_message.kind == "CancelRequest":
-            client.log("Passing on cancel request")
-            try:
-                # TODO: this needs to be "with connection"...
-                upstream_reader, upstream_writer = \
-                        await asyncio.open_connection(*self.upstream)
-            except Exception as e:
-                client.log("Passing on cancel request failed", e)
-            else:
-                # TODO: can this raise?
-                upstream_writer.write(startup_message.rawmsg)
-                upstream_writer.close()
-            finally:
-                return
+            await self.pass_on_cancel_request(client, startup_message)
+            return
 
         if startup_message.kind != "StartupMessage":
             raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
@@ -408,7 +414,6 @@ class BaseServer:
         client.log("Acceptable username, connecting upstream", username)
 
         try:
-            # TODO: this needs to be "with connection"...
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
         except Exception as e:
@@ -416,36 +421,36 @@ class BaseServer:
             client.write_simple_error(message)
             return
 
-        # TODO: can this raise?
-        upstream_writer.write(startup_message.rawmsg)
+        with upstream_writer:
+            upstream_writer.write(startup_message.rawmsg)
 
-        resp = await read_tagged_postgres_message(upstream_reader)
+            resp = await read_tagged_postgres_message(upstream_reader)
 
-        if isinstance(resp, PostgresErrorResponse):
-            reason = resp.get_reason_or_default()
-            client.log("Upstream returned an error immediately:", reason)
-            write_tagged_postgres_message(client.writer, resp)
-            return
+            if isinstance(resp, PostgresErrorResponse):
+                reason = resp.get_reason_or_default()
+                client.log("Upstream returned an error immediately:", reason)
+                write_tagged_postgres_message(client.writer, resp)
+                return
 
-        if not isinstance(resp, PostgresAuthenticationRequest):
-            message = "Unexpected message type from upstream, wanted auth request"
-            client.write_simple_error(message)
-            return
+            if not isinstance(resp, PostgresAuthenticationRequest):
+                message = "Unexpected message type from upstream, wanted auth request"
+                client.write_simple_error(message)
+                return
 
-        if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
-            message = "upstream did not want to perform password auth"
-            client.write_simple_error(message)
-            return
+            if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
+                message = "upstream did not want to perform password auth"
+                client.write_simple_error(message)
+                return
 
-        client.log("Injecting password and switching to passthrough")
+            client.log("Injecting password and switching to passthrough")
 
-        postgres_password = self.password_database[username]
-        password_message = PostgresPasswordMessage(postgres_password)
-        write_tagged_postgres_message(upstream_writer, password_message)
+            postgres_password = self.password_database[username]
+            password_message = PostgresPasswordMessage(postgres_password)
+            write_tagged_postgres_message(upstream_writer, password_message)
 
-        await asyncio.gather(
-                copy_bytes(client.reader, upstream_writer),
-                copy_bytes(upstream_reader, client.writer))
+            await asyncio.gather(
+                    copy_bytes(client.reader, upstream_writer),
+                    copy_bytes(upstream_reader, client.writer))
 
     async def handle_connection(self, reader, writer):
         log_tag = self.log_tag(writer)
@@ -453,18 +458,18 @@ class BaseServer:
 
         client.log("Received connection")
 
-        try:
-            await self.really_handle_connection(client)
-        except PostgresProtocolError as e:
-            client.log("Protocol Error", e)
-        except asyncio.IncompleteReadError as e:
-            client.log("EOF", e)
-        except Exception as e:
-            asyncio.get_running_loop().stop()
-            raise e
-        finally:
-            client.log("Connection done")
-            writer.close()
+        with writer:
+            try:
+                await self.really_handle_connection(client)
+            except PostgresProtocolError as e:
+                client.log("Protocol Error", e)
+            except asyncio.IncompleteReadError as e:
+                client.log("EOF", e)
+            except Exception as e:
+                asyncio.get_running_loop().stop()
+                raise e
+            else:
+                client.log("Connection finished gracefully")
 
 class TCPServer(BaseServer):
     def __init__(self, listen_port, **others):
