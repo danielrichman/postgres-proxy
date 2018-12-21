@@ -344,7 +344,7 @@ class BaseServer:
             if startup_message.kind == "SSLRequest":
                 raise PostgresProtocolError("Duplicate SSL Requests")
 
-            elif startup_message.kind == "CancelRequest":
+            if startup_message.kind == "CancelRequest":
                 print(log_tag, "Passing on cancel request")
                 upstream_reader, upstream_writer = \
                         await asyncio.open_connection(*self.upstream)
@@ -353,62 +353,70 @@ class BaseServer:
                 upstream_writer.close()
                 return
 
-            elif startup_message.kind == "StartupMessage":
-                if b"user" not in startup_message.args:
-                    raise PostgresProtocolError("No username in startup")
+            if startup_message.kind != "StartupMessage":
+                raise Exception("Unexpected startup_message.kind", startup_message.kind)
 
-                try:
-                    login_username = startup_message.args[b"user"].decode("ascii")
-                except UnicodeDecodeError:
-                    raise PostgresProtocolError("username is not ascii")
+            if b"user" not in startup_message.args:
+                raise PostgresProtocolError("No username in startup")
 
-                if login_username != socket_username:
-                    message = f"username mismatch: you are {socket_username}, " \
-                            f"you sent {login_username}"
-                    self.write_simple_error(writer, log_tag, message)
-                    return
+            try:
+                login_username = startup_message.args[b"user"].decode("ascii")
+            except UnicodeDecodeError:
+                raise PostgresProtocolError("username is not ascii")
 
-                if socket_username not in self.password_database:
-                    message = f"no entry for {socket_username} in password database"
-                    self.write_simple_error(writer, log_tag, message)
-                    return
+            if login_username != socket_username:
+                message = f"username mismatch: you are {socket_username}, " \
+                        f"you sent {login_username}"
+                self.write_simple_error(writer, log_tag, message)
+                return
 
-                postgres_password = self.password_database[socket_username]
+            if socket_username not in self.password_database:
+                message = f"no entry for {socket_username} in password database"
+                self.write_simple_error(writer, log_tag, message)
+                return
 
-                print(log_tag, "Acceptable username, connecting upstream", login_username)
+            postgres_password = self.password_database[socket_username]
 
-                # TODO: this might raise.
+            print(log_tag, "Acceptable username, connecting upstream", login_username)
+
+            # TODO: this might raise.
+            try:
                 upstream_reader, upstream_writer = \
                         await asyncio.open_connection(*self.upstream)
+            except Exception as e:
+                message = f"postgres proxy failed to connect upstream: {e}"
+                self.write_simple_error(writer, log_tag, message)
+                return
 
-                upstream_writer.write(startup_message.rawmsg)
+            upstream_writer.write(startup_message.rawmsg)
 
-                resp = await read_tagged_postgres_message(upstream_reader)
+            resp = await read_tagged_postgres_message(upstream_reader)
 
-                if isinstance(resp, PostgresErrorResponse):
-                    try:
-                        reason = resp.args[b"M"].decode("ascii")
-                    except:
-                        reason = "(no reason)"
-                    print(log_tag, "Upstream rejected connection outright:", reason)
-                    write_tagged_postgres_message(writer, resp)
-                    return
-                elif not isinstance(resp, PostgresAuthenticationRequest):
-                    raise PostgresProtocolError("Unexpected message type", resp.TYPE_CHAR)
+            if isinstance(resp, PostgresErrorResponse):
+                try:
+                    reason = resp.args[b"M"].decode("ascii")
+                except:
+                    reason = "(unknown reason)"
+                print(log_tag, "Upstream rejected connection outright:", reason)
+                write_tagged_postgres_message(writer, resp)
+                return
 
-                if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
-                    message = "upstream did not want to perform password auth"
-                    self.write_simple_error(writer, log_tag, message)
-                    return
+            if not isinstance(resp, PostgresAuthenticationRequest):
+                raise Exception("Unexpected message type, wanted auth request", resp.TYPE_CHAR)
 
-                print(log_tag, "Injecting password and switching to passthrough")
+            if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
+                message = "upstream did not want to perform password auth"
+                self.write_simple_error(writer, log_tag, message)
+                return
 
-                password_message = PostgresPasswordMessage(postgres_password)
-                write_tagged_postgres_message(upstream_writer, password_message)
+            print(log_tag, "Injecting password and switching to passthrough")
 
-                await asyncio.gather(
-                        copy_bytes(reader, upstream_writer),
-                        copy_bytes(upstream_reader, writer))
+            password_message = PostgresPasswordMessage(postgres_password)
+            write_tagged_postgres_message(upstream_writer, password_message)
+
+            await asyncio.gather(
+                    copy_bytes(reader, upstream_writer),
+                    copy_bytes(upstream_reader, writer))
 
         except PostgresProtocolError as e:
             print(log_tag, "Protocol Error", e)
