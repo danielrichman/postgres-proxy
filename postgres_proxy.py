@@ -1,6 +1,8 @@
 import asyncio
 import collections
+import json
 import os
+import os.path
 import pwd as passwd_database
 import socket
 import struct
@@ -543,11 +545,12 @@ class UnixServer(BaseServer):
 
         await self.unix_server.start_serving()
 
-def main():
-    common_args = {"upstream": ("localhost", 5432), 
-            "password_database": {"www-tickets": b"moo"}}
-    tcp_server = TCPServer(listen_port=5433, **common_args)
-    unix_server = UnixServer(path="/tmp/.s.PGSQL.5433", **common_args)
+def main(password_database_file, socket_directory, listen_port, upstream):
+    password_database = json.load(password_database_file)
+    common_args = {"upstream": upstream, "password_database": password_database}
+    tcp_server = TCPServer(listen_port=listen_port, **common_args)
+    socket_path = os.path.join(socket_directory, f".s.PGSQL.{listen_port}")
+    unix_server = UnixServer(path=socket_path, **common_args)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(tcp_server.start_serving())
     loop.run_until_complete(unix_server.start_serving())
@@ -556,4 +559,7 @@ def main():
     sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main(password_database_file="postgres-proxy-passwords.json",
+            socket_directory="/tmp",
+            listen_port=5433,
+            upstream=("localhost", 5432))
