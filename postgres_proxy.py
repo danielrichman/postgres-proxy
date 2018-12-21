@@ -293,7 +293,7 @@ async def copy_bytes(reader, writer):
         await writer.drain()
     writer.write_eof()
 
-class IdentificationFailed(Exception): pass
+class AuthenticationFailed(Exception): pass
 
 class BaseServer:
     def __init__(self, upstream, password_database):
@@ -317,111 +317,123 @@ class BaseServer:
     async def get_peer_uid(self, writer):
         raise NotImplementedError
 
+    async def skip_ssl_request_and_get_startup_message(self, reader):
+        startup_message = await PostgresStartup.read(reader)
+
+        if startup_message.kind == "SSLRequest":
+            # deny the SSL request:
+            writer.write(b"N")
+
+            # read the new startup message
+            startup_message = await PostgresStartup.read(reader)
+
+        if startup_message.kind == "SSLRequest":
+            raise PostgresProtocolError("Duplicate SSL Requests")
+
+        return startup_message
+
+    async def get_and_check_peer_username(self, writer, startup_message):
+        socket_uid = await self.get_peer_uid(writer)
+
+        try:
+            socket_passwd = await self.getpwuid(socket_uid)
+        except Exception as e:
+            raise AuthenticationFailed("UID lookup failed", socket_uid, e)
+
+        socket_username = socket_passwd.pw_nam
+        print(log_tag, "socket username is", socket_uid, socket_username)
+
+        if b"user" not in startup_message.args:
+            raise PostgresProtocolError("No username in startup")
+
+        try:
+            login_username = startup_message.args[b"user"].decode("ascii")
+        except UnicodeDecodeError:
+            raise PostgresProtocolError("username is not ascii")
+
+        if login_username != socket_username:
+            message = f"username mismatch: you are {socket_username}, " \
+                    f"you sent {login_username}"
+            raise AuthenticationFailed(message)
+
+        if socket_username not in self.password_database:
+            message = f"no entry for {socket_username} in password database"
+            raise AuthenticationFailed(message)
+
+        return socket_username
+
+    async def really_handle_connection(self, reader, writer, log_tag):
+        startup_message = await self.skip_ssl_request_and_get_startup_message(reader)
+
+        if startup_message.kind == "CancelRequest":
+            print(log_tag, "Passing on cancel request")
+            upstream_reader, upstream_writer = \
+                    await asyncio.open_connection(*self.upstream)
+
+            upstream_writer.write(startup_message.rawmsg)
+            upstream_writer.close()
+            return
+
+        if startup_message.kind != "StartupMessage":
+            raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
+
+        try:
+            username = await check_peer_username(writer, startup_message)
+        except AuthenticationFailed as e:
+            message = f"authentication failed: {e}"
+            self.write_simple_error(writer, log_tag, message)
+            return
+
+        print(log_tag, "Acceptable username, connecting upstream", username)
+
+        try:
+            upstream_reader, upstream_writer = \
+                    await asyncio.open_connection(*self.upstream)
+        except Exception as e:
+            message = f"postgres proxy failed to connect upstream: {e}"
+            self.write_simple_error(writer, log_tag, message)
+            return
+
+        # TODO: can this raise?
+        upstream_writer.write(startup_message.rawmsg)
+
+        resp = await read_tagged_postgres_message(upstream_reader)
+
+        if isinstance(resp, PostgresErrorResponse):
+            try:
+                reason = resp.args[b"M"].decode("ascii")
+            except:
+                reason = "(unknown reason)"
+            print(log_tag, "Upstream rejected connection outright:", reason)
+            write_tagged_postgres_message(writer, resp)
+            return
+
+        if not isinstance(resp, PostgresAuthenticationRequest):
+            raise PostgresProtocolError("Unexpected message type, wanted auth request", resp.TYPE_CHAR)
+
+        if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
+            message = "upstream did not want to perform password auth"
+            self.write_simple_error(writer, log_tag, message)
+            return
+
+        print(log_tag, "Injecting password and switching to passthrough")
+
+        postgres_password = self.password_database[username]
+        password_message = PostgresPasswordMessage(postgres_password)
+        write_tagged_postgres_message(upstream_writer, password_message)
+
+        await asyncio.gather(
+                copy_bytes(reader, upstream_writer),
+                copy_bytes(upstream_reader, writer))
+
     async def handle_connection(self, reader, writer):
         log_tag = self.log_tag(writer)
         print(log_tag, "Received connection")
 
         try:
-            socket_uid = await self.get_peer_uid(writer)
-
-            try:
-                socket_passwd = await self.getpwuid(socket_uid)
-            except Exception as e:
-                raise IdentificationFailed("UID lookup failed", socket_uid, e)
-
-            socket_username = socket_passwd.pw_nam
-            print(log_tag, "socket username is", socket_uid, socket_username)
-
-            startup_message = await PostgresStartup.read(reader)
-
-            if startup_message.kind == "SSLRequest":
-                # deny the SSL request:
-                writer.write(b"N")
-
-                # read the new startup message
-                startup_message = await PostgresStartup.read(reader)
-
-            if startup_message.kind == "SSLRequest":
-                raise PostgresProtocolError("Duplicate SSL Requests")
-
-            if startup_message.kind == "CancelRequest":
-                print(log_tag, "Passing on cancel request")
-                upstream_reader, upstream_writer = \
-                        await asyncio.open_connection(*self.upstream)
-
-                upstream_writer.write(startup_message.rawmsg)
-                upstream_writer.close()
-                return
-
-            if startup_message.kind != "StartupMessage":
-                raise Exception("Unexpected startup_message.kind", startup_message.kind)
-
-            if b"user" not in startup_message.args:
-                raise PostgresProtocolError("No username in startup")
-
-            try:
-                login_username = startup_message.args[b"user"].decode("ascii")
-            except UnicodeDecodeError:
-                raise PostgresProtocolError("username is not ascii")
-
-            if login_username != socket_username:
-                message = f"username mismatch: you are {socket_username}, " \
-                        f"you sent {login_username}"
-                self.write_simple_error(writer, log_tag, message)
-                return
-
-            if socket_username not in self.password_database:
-                message = f"no entry for {socket_username} in password database"
-                self.write_simple_error(writer, log_tag, message)
-                return
-
-            postgres_password = self.password_database[socket_username]
-
-            print(log_tag, "Acceptable username, connecting upstream", login_username)
-
-            # TODO: this might raise.
-            try:
-                upstream_reader, upstream_writer = \
-                        await asyncio.open_connection(*self.upstream)
-            except Exception as e:
-                message = f"postgres proxy failed to connect upstream: {e}"
-                self.write_simple_error(writer, log_tag, message)
-                return
-
-            upstream_writer.write(startup_message.rawmsg)
-
-            resp = await read_tagged_postgres_message(upstream_reader)
-
-            if isinstance(resp, PostgresErrorResponse):
-                try:
-                    reason = resp.args[b"M"].decode("ascii")
-                except:
-                    reason = "(unknown reason)"
-                print(log_tag, "Upstream rejected connection outright:", reason)
-                write_tagged_postgres_message(writer, resp)
-                return
-
-            if not isinstance(resp, PostgresAuthenticationRequest):
-                raise Exception("Unexpected message type, wanted auth request", resp.TYPE_CHAR)
-
-            if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
-                message = "upstream did not want to perform password auth"
-                self.write_simple_error(writer, log_tag, message)
-                return
-
-            print(log_tag, "Injecting password and switching to passthrough")
-
-            password_message = PostgresPasswordMessage(postgres_password)
-            write_tagged_postgres_message(upstream_writer, password_message)
-
-            await asyncio.gather(
-                    copy_bytes(reader, upstream_writer),
-                    copy_bytes(upstream_reader, writer))
-
+            await self.really_handle_connection(reader, writer, log_tag)
         except PostgresProtocolError as e:
             print(log_tag, "Protocol Error", e)
-        except IdentificationFailed as e:
-            print(log_tag, "Identification Failed", e)
         except asyncio.IncompleteReadError as e:
             print(log_tag, "EOF", e)
         except Exception as e:
@@ -451,7 +463,7 @@ class TCPServer(BaseServer):
         peer_addr = socket.inet_aton(peer_addr) # only works on v4.
         
         if peer_addr != self.localhost_n:
-            raise IdentificationFailed("peer_addr was not localhost")
+            raise AuthenticationFailed("peer_addr was not localhost")
 
         req_payload = NetlinkInetDiagReq.tcp4_established_port_search(
                 sport=peer_port, 
@@ -469,7 +481,7 @@ class TCPServer(BaseServer):
             return sock.uid
 
         else:
-            raise IdentificationFailed("Failed to find peer socket")
+            raise AuthenticationFailed("Failed to find peer socket")
 
     async def start_serving(self):
         self.tcp_server = await asyncio.start_server(
@@ -492,7 +504,7 @@ class UnixServer(BaseServer):
         try:
             cred = StructUCred.getpeercred(sock)
         except Exception as e:
-            raise IdentificationFailed("getpeercred failed", e)
+            raise AuthenticationFailed("getpeercred failed", e)
 
         return cred.uid
     
