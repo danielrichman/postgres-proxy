@@ -294,6 +294,15 @@ async def copy_bytes(reader, writer):
 
 class AuthenticationFailed(Exception): pass
 
+class Client:
+    def __init__(self, reader, writer, log_tag):
+        self.reader = reader
+        self.writer = writer
+        self.log_tag = log_tag
+
+    def log(self, *message):
+        print(self.log_tag, *message)
+
 class BaseServer:
     def __init__(self, upstream, password_database):
         self.upstream = upstream
@@ -316,23 +325,23 @@ class BaseServer:
     async def get_peer_uid(self, writer):
         raise NotImplementedError
 
-    async def skip_ssl_request_and_get_startup_message(self, reader):
-        startup_message = await PostgresStartup.read(reader)
+    async def skip_ssl_request_and_get_startup_message(self, client):
+        startup_message = await PostgresStartup.read(client.reader)
 
         if startup_message.kind == "SSLRequest":
             # deny the SSL request:
             writer.write(b"N")
 
             # read the new startup message
-            startup_message = await PostgresStartup.read(reader)
+            startup_message = await PostgresStartup.read(client.reader)
 
         if startup_message.kind == "SSLRequest":
             raise PostgresProtocolError("Duplicate SSL Requests")
 
         return startup_message
 
-    async def get_and_check_peer_username(self, writer, startup_message):
-        socket_uid = await self.get_peer_uid(writer)
+    async def get_and_check_peer_username(self, client, startup_message):
+        socket_uid = await self.get_peer_uid(client.writer)
 
         try:
             socket_passwd = await self.getpwuid(socket_uid)
@@ -340,7 +349,7 @@ class BaseServer:
             raise AuthenticationFailed("UID lookup failed", socket_uid, e)
 
         socket_username = socket_passwd.pw_nam
-        print(log_tag, "socket username is", socket_uid, socket_username)
+        client.log("socket username is", socket_uid, socket_username)
 
         if b"user" not in startup_message.args:
             raise PostgresProtocolError("No username in startup")
@@ -361,11 +370,11 @@ class BaseServer:
 
         return socket_username
 
-    async def really_handle_connection(self, reader, writer, log_tag):
-        startup_message = await self.skip_ssl_request_and_get_startup_message(reader)
+    async def really_handle_connection(self, client)
+        startup_message = await self.skip_ssl_request_and_get_startup_message(client)
 
         if startup_message.kind == "CancelRequest":
-            print(log_tag, "Passing on cancel request")
+            client.log("Passing on cancel request")
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
 
@@ -377,20 +386,20 @@ class BaseServer:
             raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
 
         try:
-            username = await self.check_peer_username(writer, startup_message)
+            username = await self.get_and_check_peer_username(client.writer, startup_message)
         except AuthenticationFailed as e:
             message = f"authentication failed: {e}"
-            self.write_simple_error(writer, log_tag, message)
+            self.write_simple_error(client.writer, log_tag, message)
             return
 
-        print(log_tag, "Acceptable username, connecting upstream", username)
+        client.log("Acceptable username, connecting upstream", username)
 
         try:
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
         except Exception as e:
             message = f"postgres proxy failed to connect upstream: {e}"
-            self.write_simple_error(writer, log_tag, message)
+            self.write_simple_error(client.writer, log_tag, message)
             return
 
         # TODO: can this raise?
@@ -403,8 +412,8 @@ class BaseServer:
                 reason = resp.args[b"M"].decode("ascii")
             except:
                 reason = "(unknown reason)"
-            print(log_tag, "Upstream rejected connection outright:", reason)
-            write_tagged_postgres_message(writer, resp)
+            client.log("Upstream rejected connection outright:", reason)
+            write_tagged_postgres_message(client.writer, resp)
             return
 
         if not isinstance(resp, PostgresAuthenticationRequest):
@@ -412,35 +421,37 @@ class BaseServer:
 
         if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
             message = "upstream did not want to perform password auth"
-            self.write_simple_error(writer, log_tag, message)
+            self.write_simple_error(client.writer, log_tag, message)
             return
 
-        print(log_tag, "Injecting password and switching to passthrough")
+        client.log("Injecting password and switching to passthrough")
 
         postgres_password = self.password_database[username]
         password_message = PostgresPasswordMessage(postgres_password)
         write_tagged_postgres_message(upstream_writer, password_message)
 
         await asyncio.gather(
-                copy_bytes(reader, upstream_writer),
-                copy_bytes(upstream_reader, writer))
+                copy_bytes(client.reader, upstream_writer),
+                copy_bytes(upstream_reader, client.writer))
 
     async def handle_connection(self, reader, writer):
         log_tag = self.log_tag(writer)
-        print(log_tag, "Received connection")
+        client = Client(reader, writer, log_tag)
+
+        client.log("Received connection")
 
         try:
-            await self.really_handle_connection(reader, writer, log_tag)
+            await self.really_handle_connection(client)
         except PostgresProtocolError as e:
-            print(log_tag, "Protocol Error", e)
+            client.log("Protocol Error", e)
         except asyncio.IncompleteReadError as e:
-            print(log_tag, "EOF", e)
+            client.log("EOF", e)
         except Exception as e:
             # TODO: this is too harsh.
             asyncio.get_running_loop().stop()
             raise e
         finally:
-            print(log_tag, "Connection done")
+            client.log("Connection done")
             writer.close()
 
 class TCPServer(BaseServer):
