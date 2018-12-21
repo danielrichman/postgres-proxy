@@ -253,9 +253,6 @@ class NetlinkSocket:
                 socket.AF_NETLINK, 
                 socket.SOCK_DGRAM, 
                 NETLINK_INET_DIAG)
-
-        # max netlink size is ~32kb apparently
-        self.buf = bytearray(65535)
     
     async def _one_shot_request(self, request):
         loop = asyncio.get_running_loop()
@@ -267,7 +264,7 @@ class NetlinkSocket:
 
             while offset < len(payload):
                 header = NetlinkHeader.unpack_from(payload, offset)
-                payload_offset = offset = NetlinkHeader.length
+                payload_offset = offset + NetlinkHeader.length
 
                 if header.type == NetlinkHeader.NLMSG_ERROR:
                     raise NetlinkError.unpack_from(payload, offset=payload_offset)
@@ -314,10 +311,27 @@ class BaseServer:
         resp = PostgresErrorResponse.simple(message)
         write_tagged_postgres_message(writer, resp)
 
-    async def handle_connection(self, reader, writer, log_tag, socket_username):
-        print(log_tag, "Connection; socket username is", socket_username)
+    def log_tag(self, writer):
+        raise NotImplementedError
+
+    async def get_peer_uid(self, writer):
+        raise NotImplementedError
+
+    async def handle_connection(self, reader, writer):
+        log_tag = self.log_tag(writer)
+        print(log_tag, "Received connection")
 
         try:
+            socket_uid = await self.get_peer_uid(writer)
+
+            try:
+                socket_passwd = await self.getpwuid(socket_uid)
+            except Exception as e:
+                raise IdentificationFailed("UID lookup failed", socket_uid, e)
+
+            socket_username = socket_passwd.pw_nam
+            print(log_tag, "socket username is", socket_uid, socket_username)
+
             startup_message = await PostgresStartup.read(reader)
 
             if startup_message.kind == "SSLRequest":
@@ -398,6 +412,8 @@ class BaseServer:
 
         except PostgresProtocolError as e:
             print(log_tag, "Protocol Error", e)
+        except IdentificationFailed as e:
+            print(log_tag, "Identification Failed", e)
         except asyncio.IncompleteReadError as e:
             print(log_tag, "EOF", e)
         except Exception as e:
@@ -414,12 +430,16 @@ class TCPServer(BaseServer):
         self.listen_port = listen_port
         self.netlink_socket = NetlinkSocket()
 
+    def log_tag(self, writer):
+        peername = writer.get_extra_info('peername')
+        return f"TCP:{peername[0]}:{peername[1]}" 
+
     localhost_a = "127.0.0.1"
     localhost_n = socket.inet_aton(localhost_a)
     expect_diag_addr = localhost_n + b"\x00" * 12
 
-    async def identify_peer(self, peername):
-        peer_addr, peer_port = peername
+    async def get_peer_uid(self, writer):
+        peer_addr, peer_port = writer.get_extra_info('peername')
         peer_addr = socket.inet_aton(peer_addr) # only works on v4.
         
         if peer_addr != self.localhost_n:
@@ -438,31 +458,10 @@ class TCPServer(BaseServer):
             if sock.id.dst != self.expect_diag_addr:
                 continue
 
-            try:
-                pw = await self.getpwuid(sock.uid)
-            except Exception as e:
-                raise IdentificationFailed("UID lookup failed", sock.uid, e)
-
-            return sock, pw
+            return sock.uid
 
         else:
             raise IdentificationFailed("Failed to find peer socket")
-
-    async def handle_connection(self, reader, writer):
-        peername = writer.get_extra_info('peername')
-        log_tag = f"TCP:{peername[0]}:{peername[1]}" 
-
-        try:
-            sock, passwd = await self.identify_peer(peername)
-        except IdentificationFailed as e:
-            print(log_tag, "Identification Failed", e)
-            writer.close()
-
-        await super().handle_connection(
-                reader, 
-                writer, 
-                log_tag=log_tag, 
-                socket_username=passwd.pw_name)
 
     async def start_serving(self):
         self.tcp_server = await asyncio.start_server(
@@ -475,28 +474,20 @@ class UnixServer(BaseServer):
         super().__init__(**others)
         self.path = path
 
-    async def handle_connection(self, reader, writer):
+    def log_tag(writer):
         sock = writer.get_extra_info('socket')
-        log_tag = f"UNIX:{sock.fileno()}"
+        return f"UNIX:{sock.fileno()}"
+
+    async def get_peer_uid(self, writer):
+        sock = writer.get_extra_info('socket')
 
         try:
             cred = StructUCred.getpeercred(sock)
         except Exception as e:
-            print(log_tag, "getpeercred failed", e)
-            writer.close()
+            raise IdentificationFailed("getpeercred failed", e)
 
-        try:
-            passwd = await self.getpwuid(cred.uid)
-        except Exception as e:
-            print(log_tag, "UID lookup failed", cred.uid, e)
-            writer.close()
-
-        await super().handle_connection(
-                reader, 
-                writer,
-                log_tag=log_tag,
-                socket_username=passwd.pw_name)
-
+        return cred.uid
+    
     async def start_serving(self):
         self.unix_server = await asyncio.start_unix_server(
                 self.handle_connection, self.path)
