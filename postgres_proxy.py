@@ -107,6 +107,12 @@ class PostgresErrorResponse:
             raise PostgresProtocolError("bad error response bits", bits=bits)
         return cls({b[0:1]: b[1:] for b in bits[:-2]})
 
+    def get_reason_or_default(self):
+        try:
+            return resp.args[b"M"].decode("ascii")
+        except:
+            return "(unable to retrieve reason)"
+
 class PostgresPasswordMessage:
     TYPE_CHAR = b'p'
 
@@ -314,10 +320,10 @@ class BaseServer:
         return await loop.run_in_executor(None, passwd_database.getpwuid, uid)
 
     @staticmethod
-    def write_simple_error(writer, log_tag, message):
-        print(log_tag, message)
+    def write_simple_error(client, message):
+        client.log(message)
         resp = PostgresErrorResponse.simple(message)
-        write_tagged_postgres_message(writer, resp)
+        write_tagged_postgres_message(client.writer, resp)
 
     def log_tag(self, writer):
         raise NotImplementedError
@@ -375,12 +381,18 @@ class BaseServer:
 
         if startup_message.kind == "CancelRequest":
             client.log("Passing on cancel request")
-            upstream_reader, upstream_writer = \
-                    await asyncio.open_connection(*self.upstream)
-
-            upstream_writer.write(startup_message.rawmsg)
-            upstream_writer.close()
-            return
+            try:
+                # TODO: this needs to be "with connection"...
+                upstream_reader, upstream_writer = \
+                        await asyncio.open_connection(*self.upstream)
+            except Exception as e:
+                client.log("Passing on cancel request failed", e)
+            else:
+                # TODO: can this raise?
+                upstream_writer.write(startup_message.rawmsg)
+                upstream_writer.close()
+            finally:
+                return
 
         if startup_message.kind != "StartupMessage":
             raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
@@ -389,17 +401,18 @@ class BaseServer:
             username = await self.get_and_check_peer_username(client.writer, startup_message)
         except AuthenticationFailed as e:
             message = f"authentication failed: {e}"
-            self.write_simple_error(client.writer, log_tag, message)
+            self.write_simple_error(client.writer, message)
             return
 
         client.log("Acceptable username, connecting upstream", username)
 
         try:
+            # TODO: this needs to be "with connection"...
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
         except Exception as e:
             message = f"postgres proxy failed to connect upstream: {e}"
-            self.write_simple_error(client.writer, log_tag, message)
+            self.write_simple_error(client.writer, message)
             return
 
         # TODO: can this raise?
@@ -408,20 +421,19 @@ class BaseServer:
         resp = await read_tagged_postgres_message(upstream_reader)
 
         if isinstance(resp, PostgresErrorResponse):
-            try:
-                reason = resp.args[b"M"].decode("ascii")
-            except:
-                reason = "(unknown reason)"
-            client.log("Upstream rejected connection outright:", reason)
+            reason = resp.get_reason_or_default()
+            client.log("Upstream returned an error immediately:", reason)
             write_tagged_postgres_message(client.writer, resp)
             return
 
         if not isinstance(resp, PostgresAuthenticationRequest):
-            raise PostgresProtocolError("Unexpected message type, wanted auth request", resp.TYPE_CHAR)
+            message = "Unexpected message type from upstream, wanted auth request"
+            self.write_simple_error(client.writer, message)
+            return
 
         if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
             message = "upstream did not want to perform password auth"
-            self.write_simple_error(client.writer, log_tag, message)
+            self.write_simple_error(client.writer, message)
             return
 
         client.log("Injecting password and switching to passthrough")
@@ -447,7 +459,6 @@ class BaseServer:
         except asyncio.IncompleteReadError as e:
             client.log("EOF", e)
         except Exception as e:
-            # TODO: this is too harsh.
             asyncio.get_running_loop().stop()
             raise e
         finally:
