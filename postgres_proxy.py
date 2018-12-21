@@ -282,9 +282,8 @@ class NetlinkSocket:
                 yield result
         finally:
             # We must pull everything out of the socket until the Done message.
-            count = 0
             async for _discard in aiter:
-                count += 1
+                pass
 
 async def copy_bytes(reader, writer):
     while not reader.at_eof():
@@ -378,7 +377,7 @@ class BaseServer:
             raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
 
         try:
-            username = await check_peer_username(writer, startup_message)
+            username = await self.check_peer_username(writer, startup_message)
         except AuthenticationFailed as e:
             message = f"authentication failed: {e}"
             self.write_simple_error(writer, log_tag, message)
