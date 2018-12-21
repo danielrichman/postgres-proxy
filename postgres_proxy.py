@@ -300,6 +300,8 @@ async def copy_bytes(reader, writer):
 
 class AuthenticationFailed(Exception): pass
 
+# Think of client as a glorified three tuple, with some trivial helper functions.
+# The core logic lives in BaseServer.
 class Client:
     def __init__(self, reader, writer, log_tag):
         self.reader = reader
@@ -308,6 +310,11 @@ class Client:
 
     def log(self, *message):
         print(self.log_tag, *message)
+
+    def write_simpe_error(self, message):
+        self.log(message)
+        resp = PostgresErrorResponse.simple(message)
+        write_tagged_postgres_message(self, resp)
 
 class BaseServer:
     def __init__(self, upstream, password_database):
@@ -318,12 +325,6 @@ class BaseServer:
     async def getpwuid(uid):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, passwd_database.getpwuid, uid)
-
-    @staticmethod
-    def write_simple_error(client, message):
-        client.log(message)
-        resp = PostgresErrorResponse.simple(message)
-        write_tagged_postgres_message(client.writer, resp)
 
     def log_tag(self, writer):
         raise NotImplementedError
@@ -398,10 +399,10 @@ class BaseServer:
             raise Exception("BUG: failed to match on startup_message.kind", startup_message.kind)
 
         try:
-            username = await self.get_and_check_peer_username(client.writer, startup_message)
+            username = await self.get_and_check_peer_username(client, startup_message)
         except AuthenticationFailed as e:
             message = f"authentication failed: {e}"
-            self.write_simple_error(client.writer, message)
+            client.write_simple_error(message)
             return
 
         client.log("Acceptable username, connecting upstream", username)
@@ -412,7 +413,7 @@ class BaseServer:
                     await asyncio.open_connection(*self.upstream)
         except Exception as e:
             message = f"postgres proxy failed to connect upstream: {e}"
-            self.write_simple_error(client.writer, message)
+            client.write_simple_error(message)
             return
 
         # TODO: can this raise?
@@ -428,12 +429,12 @@ class BaseServer:
 
         if not isinstance(resp, PostgresAuthenticationRequest):
             message = "Unexpected message type from upstream, wanted auth request"
-            self.write_simple_error(client.writer, message)
+            client.write_simple_error(message)
             return
 
         if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
             message = "upstream did not want to perform password auth"
-            self.write_simple_error(client.writer, message)
+            client.write_simple_error(message)
             return
 
         client.log("Injecting password and switching to passthrough")
