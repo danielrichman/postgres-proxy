@@ -8,8 +8,10 @@ import socket
 import struct
 import sys
 
-# TODO: can write raise?
-# TODO: does `with writer` work?
+# TODO: think harder about where connections should be closed; what's the
+# idiomatic thing to do; why doesn't `with ....` work.
+
+# TODO: think harder about where streamwriter can raise and how
 
 class PostgresProtocolError(Exception):
     def __init__(self, sentence, **kwargs):
@@ -114,7 +116,7 @@ class PostgresErrorResponse:
 
     def get_reason_or_default(self):
         try:
-            return resp.args[b"M"].decode("ascii")
+            return self.args[b"M"].decode("ascii")
         except:
             return "(unable to retrieve reason)"
 
@@ -316,10 +318,10 @@ class Client:
     def log(self, *message):
         print(self.log_tag, *message)
 
-    def write_simpe_error(self, message):
+    def write_simple_error(self, message):
         self.log(message)
         resp = PostgresErrorResponse.simple(message)
-        write_tagged_postgres_message(self, resp)
+        write_tagged_postgres_message(self.writer, resp)
 
 class BaseServer:
     def __init__(self, upstream, password_database):
@@ -342,7 +344,7 @@ class BaseServer:
 
         if startup_message.kind == "SSLRequest":
             # deny the SSL request:
-            writer.write(b"N")
+            client.writer.write(b"N")
 
             # read the new startup message
             startup_message = await PostgresStartup.read(client.reader)
@@ -360,7 +362,7 @@ class BaseServer:
         except Exception as e:
             raise AuthenticationFailed("UID lookup failed", socket_uid, e)
 
-        socket_username = socket_passwd.pw_nam
+        socket_username = socket_passwd.pw_name
         client.log("socket username is", socket_uid, socket_username)
 
         if b"user" not in startup_message.args:
@@ -387,16 +389,27 @@ class BaseServer:
 
         client.log("Passing on cancel request")
 
+        upstream_writer = None
+
         try:
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
 
-            with upstream_writer:
-                upstream_writer.write(startup_message.rawmsg)
+            upstream_writer.write(startup_message.rawmsg)
+            upstream_writer.write_eof()
+
+            # Wait for EOF.
+            response = await upstream_reader.read(1)
+            if response != b"":
+                raise PostgresProtocolError("received data in response to cancelrequest")
         except Exception as e:
             client.log("Passing on cancel request failed", e)
+        finally:
+            # TODO: there should be a more idiomatic way to do this
+            if upstream_writer is not None:
+                upstream_writer.close()
 
-    async def really_handle_connection(self, client)
+    async def really_handle_connection(self, client):
         startup_message = await self.skip_ssl_request_and_get_startup_message(client)
 
         if startup_message.kind == "CancelRequest":
@@ -423,7 +436,7 @@ class BaseServer:
             client.write_simple_error(message)
             return
 
-        with upstream_writer:
+        try:
             upstream_writer.write(startup_message.rawmsg)
 
             resp = await read_tagged_postgres_message(upstream_reader)
@@ -454,24 +467,28 @@ class BaseServer:
                     copy_bytes(client.reader, upstream_writer),
                     copy_bytes(upstream_reader, client.writer))
 
+        finally:
+            upstream_writer.close()
+
     async def handle_connection(self, reader, writer):
         log_tag = self.log_tag(writer)
         client = Client(reader, writer, log_tag)
 
         client.log("Received connection")
 
-        with writer:
-            try:
-                await self.really_handle_connection(client)
-            except PostgresProtocolError as e:
-                client.log("Protocol Error", e)
-            except asyncio.IncompleteReadError as e:
-                client.log("EOF", e)
-            except Exception as e:
-                asyncio.get_running_loop().stop()
-                raise e
-            else:
-                client.log("Connection finished gracefully")
+        try:
+            await self.really_handle_connection(client)
+        except PostgresProtocolError as e:
+            client.log("Protocol Error", e)
+        except asyncio.IncompleteReadError as e:
+            client.log("EOF", e)
+        except Exception as e:
+            asyncio.get_running_loop().stop()
+            raise e
+        else:
+            client.log("Connection finished gracefully")
+        finally:
+            writer.close()
 
 class TCPServer(BaseServer):
     def __init__(self, listen_port, **others):
@@ -523,7 +540,7 @@ class UnixServer(BaseServer):
         super().__init__(**others)
         self.path = path
 
-    def log_tag(writer):
+    def log_tag(self, writer):
         sock = writer.get_extra_info('socket')
         return f"UNIX:{sock.fileno()}"
 
@@ -545,12 +562,15 @@ class UnixServer(BaseServer):
 
         await self.unix_server.start_serving()
 
-def main(password_database_file, socket_directory, listen_port, upstream):
-    password_database = json.load(password_database_file)
+def main(password_database_filename, socket_directory, listen_port, upstream):
+    with open(password_database_filename) as password_database_file:
+        password_database = json.load(password_database_file)
     common_args = {"upstream": upstream, "password_database": password_database}
+
     tcp_server = TCPServer(listen_port=listen_port, **common_args)
     socket_path = os.path.join(socket_directory, f".s.PGSQL.{listen_port}")
     unix_server = UnixServer(path=socket_path, **common_args)
+
     loop = asyncio.get_event_loop()
     loop.run_until_complete(tcp_server.start_serving())
     loop.run_until_complete(unix_server.start_serving())
@@ -559,7 +579,7 @@ def main(password_database_file, socket_directory, listen_port, upstream):
     sys.exit(1)
 
 if __name__ == "__main__":
-    main(password_database_file="postgres-proxy-passwords.json",
+    main(password_database_filename="postgres-proxy-passwords.json",
             socket_directory="/tmp",
             listen_port=5433,
             upstream=("localhost", 5432))
