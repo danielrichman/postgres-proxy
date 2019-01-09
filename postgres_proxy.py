@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import collections
 import json
@@ -384,7 +385,7 @@ class BaseServer:
 
         return socket_username
 
-    async def pass_on_cancel_request(self, startup_message):
+    async def pass_on_cancel_request(self, client, startup_message):
         assert startup_message.kind == "CancelRequest"
 
         client.log("Passing on cancel request")
@@ -459,7 +460,9 @@ class BaseServer:
 
             client.log("Injecting password and switching to passthrough")
 
-            postgres_password = self.password_database[username]
+            # 1) get_and_check_peer_username checked that the username is one we recognise.
+            # 2) we validated that all our passwords were ascii at startup.
+            postgres_password = self.password_database[username].encode("ascii")
             password_message = PostgresPasswordMessage(postgres_password)
             write_tagged_postgres_message(upstream_writer, password_message)
 
@@ -565,6 +568,13 @@ class UnixServer(BaseServer):
 def main(password_database_filename, socket_directory, listen_port, upstream):
     with open(password_database_filename) as password_database_file:
         password_database = json.load(password_database_file)
+
+    for key, value in password_database.items():
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError:
+            raise Exception("user's password is not ascii", key)
+
     common_args = {"upstream": upstream, "password_database": password_database}
 
     tcp_server = TCPServer(listen_port=listen_port, **common_args)
@@ -578,8 +588,20 @@ def main(password_database_filename, socket_directory, listen_port, upstream):
     loop.run_forever()
     sys.exit(1)
 
+def parse_args_run_main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--password-database", help="e.g. /etc/postgres-proxy-passwords.json")
+    parser.add_argument("--socket-directory", help="e.g. /run/postgresql", default="/run/postgresql")
+    parser.add_argument("--listen-port", type=int, help="e.g. 5432", default=5432)
+    parser.add_argument("--upstream-host", help="e.g., my-host.my-domain")
+    parser.add_argument("--upstream-port", type=int, help="e.g. 5432", default=5432)
+
+    args = parser.parse_args()
+
+    main(password_database_filename=args.password_database,
+            socket_directory=args.socket_directory,
+            listen_port=args.listen_port,
+            upstream=(args.upstream_host, args.upstream_port))
+
 if __name__ == "__main__":
-    main(password_database_filename="postgres-proxy-passwords.json",
-            socket_directory="/tmp",
-            listen_port=5433,
-            upstream=("localhost", 5432))
+    parse_args_run_main()
