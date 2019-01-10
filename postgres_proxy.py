@@ -9,11 +9,6 @@ import socket
 import struct
 import sys
 
-# TODO: think harder about where connections should be closed; what's the
-# idiomatic thing to do; why doesn't `with ....` work.
-
-# TODO: think harder about where streamwriter can raise and how
-
 class PostgresProtocolError(Exception):
     def __init__(self, sentence, **kwargs):
         self.sentence = sentence
@@ -325,6 +320,8 @@ class Client:
         write_tagged_postgres_message(self.writer, resp)
 
 class BaseServer:
+    connection_count = 0
+
     def __init__(self, upstream, password_database):
         self.upstream = upstream
         self.password_database = password_database
@@ -406,7 +403,6 @@ class BaseServer:
         except Exception as e:
             client.log("Passing on cancel request failed", e)
         finally:
-            # TODO: there should be a more idiomatic way to do this
             if upstream_writer is not None:
                 upstream_writer.close()
 
@@ -474,7 +470,8 @@ class BaseServer:
             upstream_writer.close()
 
     async def handle_connection(self, reader, writer):
-        log_tag = self.log_tag(writer)
+        BaseServer.connection_count += 1
+        log_tag = f"{BaseServer.connection_count}-{self.log_tag(writer)}"
         client = Client(reader, writer, log_tag)
 
         client.log("Received connection")
@@ -486,8 +483,11 @@ class BaseServer:
         except asyncio.IncompleteReadError as e:
             client.log("EOF", e)
         except Exception as e:
-            asyncio.get_running_loop().stop()
-            raise e
+            # The only reason I'm OK with this is that we don't have any state that
+            # is not local to a single connection. If we did, we'd want to be a lot
+            # more careful isolating exceptions due to routine IO failure from bugs
+            # and make sure we crash on the latter.
+            client.log("Connection destroyed by exception", e)
         else:
             client.log("Connection finished gracefully")
         finally:
@@ -590,10 +590,10 @@ def main(password_database_filename, socket_directory, listen_port, upstream):
 
 def parse_args_run_main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--password-database", help="e.g. /etc/postgres-proxy-passwords.json")
+    parser.add_argument("--password-database", help="e.g. /etc/postgres-proxy-passwords.json", required=True)
     parser.add_argument("--socket-directory", help="e.g. /run/postgresql", default="/run/postgresql")
     parser.add_argument("--listen-port", type=int, help="e.g. 5432", default=5432)
-    parser.add_argument("--upstream-host", help="e.g., my-host.my-domain")
+    parser.add_argument("--upstream-host", help="e.g., my-host.my-domain", required=True)
     parser.add_argument("--upstream-port", type=int, help="e.g. 5432", default=5432)
 
     args = parser.parse_args()
