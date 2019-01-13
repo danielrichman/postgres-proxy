@@ -8,6 +8,7 @@ import pwd as passwd_database
 import socket
 import struct
 import sys
+import syslog
 
 class PostgresProtocolError(Exception):
     def __init__(self, sentence, **kwargs):
@@ -312,7 +313,8 @@ class Client:
         self.log_tag = log_tag
 
     def log(self, *message):
-        print(self.log_tag, *message)
+        parts = [self.log_tag] + [str(s) for s in message]
+        syslog.syslog(syslog.LOG_INFO, " ".join(parts))
 
     def write_simple_error(self, message):
         self.log(message)
@@ -566,6 +568,8 @@ class UnixServer(BaseServer):
         await self.unix_server.start_serving()
 
 def main(password_database_filename, socket_directory, listen_port, upstream):
+    syslog.openlog(ident="postgres-proxy", facility=syslog.LOG_DAEMON)
+
     with open(password_database_filename) as password_database_file:
         password_database = json.load(password_database_file)
 
@@ -584,9 +588,13 @@ def main(password_database_filename, socket_directory, listen_port, upstream):
     loop = asyncio.get_event_loop()
     loop.run_until_complete(tcp_server.start_serving())
     loop.run_until_complete(unix_server.start_serving())
-    print("Listening")
-    loop.run_forever()
-    sys.exit(1)
+    syslog.syslog(syslog.LOG_INFO, "listening")
+    try:
+        loop.run_forever()
+    except Exception as e:
+        syslog.syslog(syslog.LOG_ERR, f"uncaught exception: {e}")
+    finally:
+        sys.exit(1)
 
 def parse_args_run_main():
     parser = argparse.ArgumentParser()
