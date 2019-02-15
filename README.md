@@ -33,3 +33,7 @@ verbatim back to the client, since it will either be a authentication-ok or
 error response, exactly what the client was expecting in response to its startup
 message. So we switch to passing bytes back and forth without inspecting the
 response to the injected password.
+
+Since we only need to implement a couple message types of the PostgreSQL and
+netlink protocols, neither are particularly well abstracted, it's just a single
+file with the one-off bits required. Good luck.
