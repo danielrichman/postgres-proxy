@@ -36,4 +36,4 @@ response to the injected password.
 
 Since we only need to implement a couple message types of the PostgreSQL and
 netlink protocols, neither are particularly well abstracted, it's just a single
-file with the one-off bits required. Good luck.
+file with the minimal one-off bits required. Good luck.
