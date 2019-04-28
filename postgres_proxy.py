@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import collections
+import hashlib
 import json
 import os
 import os.path
@@ -77,15 +78,20 @@ class PostgresAuthenticationRequest:
     TYPE_CHAR = b'R'
 
     OK = 0
-    CLEARTEXT_PASSWORD = 3
+    MD5_PASSWORD = 5
 
-    def __init__(self, code):
+    def __init__(self, code, salt=None):
         self.code = code
+        self.salt = salt
 
     @classmethod
     def unpack(cls, payload):
         code, = struct.unpack_from(">i", payload)
-        return cls(code)
+        if code == cls.MD5_PASSWORD:
+            salt = payload[4:8]
+            return cls(code, salt=salt)
+        else:
+            return cls(code)
 
 class PostgresErrorResponse:
     TYPE_CHAR = b'E'
@@ -304,6 +310,15 @@ async def copy_bytes(reader, writer):
         await writer.drain()
     writer.write_eof()
 
+def md5_hex(string):
+    return hashlib.md5(string).hexdigest()
+
+def digest_password(username, password, salt):
+    username = username.encode("ascii")
+    password = password.encode("ascii")
+    h1 = md5_hex(password + username).encode("ascii")
+    return "md5" + md5_hex(h1 + salt)
+
 class AuthenticationFailed(Exception): pass
 
 # Think of client as a glorified three tuple, with some trivial helper functions.
@@ -453,8 +468,8 @@ class BaseServer:
                 client.write_simple_error(message)
                 return
 
-            if resp.code != PostgresAuthenticationRequest.CLEARTEXT_PASSWORD:
-                message = "upstream did not want to perform password auth"
+            if resp.code != PostgresAuthenticationRequest.MD5_PASSWORD:
+                message = "upstream did not want to perform md5 password auth"
                 client.write_simple_error(message)
                 return
 
@@ -462,8 +477,9 @@ class BaseServer:
 
             # 1) get_and_check_peer_username checked that the username is one we recognise.
             # 2) we validated that all our passwords were ascii at startup.
-            postgres_password = self.password_database[username].encode("ascii")
-            password_message = PostgresPasswordMessage(postgres_password)
+            postgres_password = self.password_database[username]
+            digested_password = digest_password(username, postgres_password, resp.salt).encode("ascii")
+            password_message = PostgresPasswordMessage(digested_password)
             write_tagged_postgres_message(upstream_writer, password_message)
 
             await asyncio.gather(
