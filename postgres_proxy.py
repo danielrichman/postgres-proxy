@@ -552,8 +552,6 @@ class TCPServer(BaseServer):
         self.tcp_server = await asyncio.start_server(
             self.handle_connection, '127.0.0.1', self.listen_port)
 
-        await self.tcp_server.start_serving()
-
 class UnixServer(BaseServer):
     def __init__(self, path, **others):
         super().__init__(**others)
@@ -578,8 +576,6 @@ class UnixServer(BaseServer):
                 self.handle_connection, self.path)
 
         os.chmod(self.path, 0o777)
-
-        await self.unix_server.start_serving()
 
 def main(password_database_filename, socket_directory, listen_port, upstream):
     syslog.openlog(ident="postgres-proxy", facility=syslog.LOG_DAEMON)
