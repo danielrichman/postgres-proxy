@@ -276,7 +276,7 @@ class NetlinkSocket:
     # must pull all messages out of the socket until the "done", even if the
     # caller crashes and stops pulling things out of the iterator.
     async def one_shot_request(self, request):
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         await loop.sock_sendall(self.sock, request)
 
         results = []
@@ -343,7 +343,7 @@ class BaseServer:
 
     @staticmethod
     async def getpwuid(uid):
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, passwd_database.getpwuid, uid)
 
     def log_tag(self, writer):
@@ -536,7 +536,9 @@ class TCPServer(BaseServer):
 
         req = NetlinkHeader.sock_diag_request(len(req_payload)).pack() + req_payload
 
-        async for sock in self.netlink_socket.one_shot_request(req):
+        socks = await self.netlink_socket.one_shot_request(req)
+
+        for sock in socks:
             if sock.id.src != self.expect_diag_addr:
                 continue
             
