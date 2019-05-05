@@ -271,10 +271,15 @@ class NetlinkSocket:
                 socket.AF_NETLINK, 
                 socket.SOCK_DGRAM, 
                 NETLINK_INET_DIAG)
-    
-    async def _one_shot_request(self, request):
+
+    # This isn't a generator because (a) python 3.5 compatiblity, and (b) we
+    # must pull all messages out of the socket until the "done", even if the
+    # caller crashes and stops pulling things out of the iterator.
+    async def one_shot_request(self, request):
         loop = asyncio.get_running_loop()
         await loop.sock_sendall(self.sock, request)
+
+        results = []
 
         while True:
             payload = await loop.sock_recv(self.sock, 65535) 
@@ -285,23 +290,14 @@ class NetlinkSocket:
                 payload_offset = offset + NetlinkHeader.length
 
                 if header.type == NetlinkHeader.NLMSG_ERROR:
+                    self.sock.close()
                     raise NetlinkError.unpack_from(payload, offset=payload_offset)
                 elif header.type == NetlinkHeader.NLMSG_DONE:
-                    return
+                    return results
                 elif header.type == NetlinkHeader.SOCK_DIAG_BY_FAMILY:
-                    yield NetlinkInetDiagMsg.unpack_from(payload, offset=payload_offset)
+                    msg = NetlinkInetDiagMsg.unpack_from(payload, offset=payload_offset)
+                    results.append(msg)
                     offset += header.total_length
-
-    async def one_shot_request(self, request):
-        aiter = self._one_shot_request(request).__aiter__()
-
-        try:
-            async for result in aiter:
-                yield result
-        finally:
-            # We must pull everything out of the socket until the Done message.
-            async for _discard in aiter:
-                pass
 
 async def copy_bytes(reader, writer):
     while not reader.at_eof():
