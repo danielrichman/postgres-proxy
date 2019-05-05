@@ -19,7 +19,7 @@ class PostgresProtocolError(Exception):
         self.kwargs = kwargs
         
     def __str__(self):
-        return f"{self.sentence}: {self.kwargs}"
+        return "{0.sentence}: {0.kwargs}".format(self)
 
 class PostgresStartup:
     def __init__(self, rawmsg, kind, args):
@@ -215,7 +215,7 @@ class NetlinkInetDiagSockid(_NetlinkInetDiagSockid):
 _NetlinkInetDiagReq = collections.namedtuple("_NetlinkInetDiagReq",
         ["family", "protocol", "ext", "states", "id"])
 class NetlinkInetDiagReq(_NetlinkInetDiagReq):
-    format = f"=bbbxI{NetlinkInetDiagSockid.length}s"
+    format = "=bbbxI{0}s".format(NetlinkInetDiagSockid.length)
     length = struct.calcsize(format)
 
     TCP_ESTABLISHED = 1
@@ -243,7 +243,7 @@ _NetlinkInetDiagMsg = collections.namedtuple("_NetlinkInetDiagMsg",
         ["family", "state", "timer", "retrans", "id", 
             "expires", "rqueue", "wqueue", "uid", "inode"])
 class NetlinkInetDiagMsg(_NetlinkInetDiagMsg):
-    format = f"=bbbb{NetlinkInetDiagSockid.length}sIIIII"
+    format = "=bbbb{0}sIIIII".format(NetlinkInetDiagSockid.length)
 
     @classmethod
     def unpack_from(cls, buffer, offset):
@@ -391,12 +391,12 @@ class BaseServer:
             raise PostgresProtocolError("username is not ascii")
 
         if login_username != socket_username:
-            message = f"username mismatch: you are {socket_username}, " \
-                    f"you sent {login_username}"
+            message = "username mismatch: you are {}, you sent {}" \
+                        .format(socket_username, login_username)
             raise AuthenticationFailed(message)
 
         if socket_username not in self.password_database:
-            message = f"no entry for {socket_username} in password database"
+            message = "no entry for {} in password database".format(socket_username)
             raise AuthenticationFailed(message)
 
         return socket_username
@@ -438,7 +438,7 @@ class BaseServer:
         try:
             username = await self.get_and_check_peer_username(client, startup_message)
         except AuthenticationFailed as e:
-            message = f"authentication failed: {e}"
+            message = "authentication failed: {}".format(e)
             client.write_simple_error(message)
             return
 
@@ -448,7 +448,7 @@ class BaseServer:
             upstream_reader, upstream_writer = \
                     await asyncio.open_connection(*self.upstream)
         except Exception as e:
-            message = f"postgres proxy failed to connect upstream: {e}"
+            message = "postgres proxy failed to connect upstream: {}".format(e)
             client.write_simple_error(message)
             return
 
@@ -491,7 +491,7 @@ class BaseServer:
 
     async def handle_connection(self, reader, writer):
         BaseServer.connection_count += 1
-        log_tag = f"{BaseServer.connection_count}-{self.log_tag(writer)}"
+        log_tag = "{}-{}".format(BaseServer.connection_count, self.log_tag(writer))
         client = Client(reader, writer, log_tag)
 
         client.log("Received connection")
@@ -521,7 +521,7 @@ class TCPServer(BaseServer):
 
     def log_tag(self, writer):
         peername = writer.get_extra_info('peername')
-        return f"TCP:{peername[0]}:{peername[1]}" 
+        return "TCP:{}:{}".format(*peername)
 
     localhost_a = "127.0.0.1"
     localhost_n = socket.inet_aton(localhost_a)
@@ -565,7 +565,7 @@ class UnixServer(BaseServer):
 
     def log_tag(self, writer):
         sock = writer.get_extra_info('socket')
-        return f"UNIX:{sock.fileno()}"
+        return "UNIX:{}".format(sock.fileno())
 
     async def get_peer_uid(self, writer):
         sock = writer.get_extra_info('socket')
@@ -600,7 +600,7 @@ def main(password_database_filename, socket_directory, listen_port, upstream):
     common_args = {"upstream": upstream, "password_database": password_database}
 
     tcp_server = TCPServer(listen_port=listen_port, **common_args)
-    socket_path = os.path.join(socket_directory, f".s.PGSQL.{listen_port}")
+    socket_path = os.path.join(socket_directory, ".s.PGSQL.{}".format(listen_port))
     unix_server = UnixServer(path=socket_path, **common_args)
 
     loop = asyncio.get_event_loop()
@@ -610,7 +610,7 @@ def main(password_database_filename, socket_directory, listen_port, upstream):
     try:
         loop.run_forever()
     except Exception as e:
-        syslog.syslog(syslog.LOG_ERR, f"uncaught exception: {e}")
+        syslog.syslog(syslog.LOG_ERR, "uncaught exception: {}".format(e))
     finally:
         sys.exit(1)
 
