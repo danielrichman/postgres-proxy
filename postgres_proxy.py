@@ -513,7 +513,6 @@ class TCPServer(BaseServer):
     def __init__(self, listen_port, **others):
         super().__init__(**others)
         self.listen_port = listen_port
-        self.netlink_socket = NetlinkSocket()
 
     def log_tag(self, writer):
         peername = writer.get_extra_info('peername')
@@ -536,7 +535,7 @@ class TCPServer(BaseServer):
 
         req = NetlinkHeader.sock_diag_request(len(req_payload)).pack() + req_payload
 
-        socks = await self.netlink_socket.one_shot_request(req)
+        socks = await NetlinkSocket().one_shot_request(req)
 
         for sock in socks:
             if sock.id.src != self.expect_diag_addr:
